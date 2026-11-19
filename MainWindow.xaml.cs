@@ -21,7 +21,10 @@ public partial class MainWindow : Window
     private Channel? current;
     private HlsRelay? relay;
     private string? sourceError;
-    private string? source;
+    private SourceLibrary library = new([], null);
+    private PlaylistSource? ActiveSource => library.Sources.FirstOrDefault(item => item.Id == library.ActiveId);
+    private bool sourcePickerUpdating;
+    private bool sourcesReady;
     private bool loading, closing, fullscreen;
     private WindowState previousState;
     private VideoDoubleClick? videoDoubleClick;
@@ -30,7 +33,7 @@ public partial class MainWindow : Window
     private sealed record Preferences(string? Source, string? LastChannel, double Volume);
     public MainWindow() { InitializeComponent(); }
 
-    private async void OnLoaded(object sender, RoutedEventArgs e)
+    private void OnLoaded(object sender, RoutedEventArgs e)
     {
         try
         {
@@ -48,32 +51,25 @@ public partial class MainWindow : Window
             };
             timer.Start();
             var prefsFile = Path.Combine(DataDir, "settings.json");
-            if (File.Exists(prefsFile))
-            {
-                var prefs = JsonSerializer.Deserialize<Preferences>(await File.ReadAllTextAsync(prefsFile));
-                if (prefs != null)
-                {
-                    Volume.Value = Math.Clamp(prefs.Volume, 0, 100);
-                    source = prefs.Source;
-                    var cache = Path.Combine(DataDir, "playlist.m3u");
-                    if (File.Exists(cache))
-                    {
-                        ApplyPlaylist(Playlist.Parse(await File.ReadAllTextAsync(cache), SourceUri(source)));
-                        current = all.FirstOrDefault(c => c.Url == prefs.LastChannel);
-                        if (current != null) NowPlaying.Text = $"上次：{current.Name} · 点击重试播放";
-                        Status.Text = "已恢复上次列表 · 点击频道开始播放";
-                    }
-                }
-            }
+            var prefs = File.Exists(prefsFile)
+                ? JsonSerializer.Deserialize<Preferences>(File.ReadAllText(prefsFile))
+                : null;
+            if (prefs != null) Volume.Value = Math.Clamp(prefs.Volume, 0, 100);
+            library = SourceLibrary.Load(DataDir, prefs?.Source);
+            sourcesReady = true;
+            ShowActiveSource();
+            current = all.FirstOrDefault(c => c.Url == prefs?.LastChannel);
+            if (current != null) NowPlaying.Text = $"上次：{current.Name} · 点击重试播放";
+            if (ActiveSource != null) Status.Text = "已恢复播放来源 · 点击频道开始播放";
         }
-        catch { Status.Text = "初始化失败，请确保程序文件夹完整，包含 MDK 内核。"; }
+        catch { Status.Text = "初始化失败，无法读取本机播放来源或启动播放器。"; }
     }
     private void Ui(Action action) { if (!closing) Dispatcher.BeginInvoke(() => { if (!closing) action(); }); }
     private static Uri? SourceUri(string? value) => Uri.TryCreate(value, UriKind.Absolute, out var uri) ? uri : null;
 
-    private async Task LoadPlaylist(string location)
+    private async Task LoadPlaylist(string location, string? name = null)
     {
-        if (loading) return;
+        if (loading || !sourcesReady) return;
         loading = true; Status.Text = "正在导入播放列表…";
         try
         {
@@ -97,14 +93,16 @@ public partial class MainWindow : Window
             }
             var parsed = Playlist.Parse(text, baseUri);
             if (parsed.Count == 0) throw new InvalidDataException();
-            source = location; ApplyPlaylist(parsed);
-            Directory.CreateDirectory(DataDir);
-            // Normalize relative addresses before persisting the cache.
-            var normalized = string.Join("\n", parsed.Select(c => $"#EXTINF:-1 group-title=\"{c.Group.Replace("\"", "") }\",{c.Name}\n" +
-                (c.UserAgent != null ? $"#EXTVLCOPT:http-user-agent={c.UserAgent}\n" : "") +
-                (c.Referrer != null ? $"#EXTVLCOPT:http-referrer={c.Referrer}\n" : "") + c.Url));
-            await File.WriteAllTextAsync(Path.Combine(DataDir, "playlist.m3u"), "#EXTM3U\n" + normalized);
-            Save(); Status.Text = $"已导入 {parsed.Count} 个频道 · 点击频道开始播放";
+            if (closing) return;
+            var existing = library.Sources.FirstOrDefault(item => SameLocation(item.Location, location));
+            var entry = new PlaylistSource(existing?.Id ?? Guid.NewGuid(),
+                name ?? existing?.Name ?? DefaultSourceName(location), location, parsed);
+            var entries = library.Sources.ToList();
+            if (existing == null) entries.Add(entry);
+            else entries[entries.IndexOf(existing)] = entry;
+            SaveLibrary(new(entries, entry.Id));
+            Save();
+            Status.Text = $"已保存 {entry.Name} · {parsed.Count} 个频道";
         }
         catch (HttpRequestException ex) { Status.Text = ex.StatusCode.HasValue ? $"导入失败：服务器返回 HTTP {(int)ex.StatusCode.Value}" : "导入失败：无法连接订阅服务器"; }
         catch (TaskCanceledException) { Status.Text = "导入超时，请检查网络后重试。"; }
@@ -112,6 +110,55 @@ public partial class MainWindow : Window
         catch { Status.Text = "导入或保存失败，请检查文件及目录权限。"; }
         finally { loading = false; }
     }
+    private static bool SameLocation(string? left, string right)
+    {
+        if (left == null) return false;
+        if (SourceUri(right)?.Scheme is "http" or "https")
+            return string.Equals(SourceUri(left)?.AbsoluteUri, SourceUri(right)?.AbsoluteUri, StringComparison.Ordinal);
+        return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string DefaultSourceName(string location) =>
+        SourceUri(location) is { Scheme: "http" or "https" } uri
+            ? uri.Host : Path.GetFileNameWithoutExtension(location);
+
+    private void SaveLibrary(SourceLibrary updated)
+    {
+        updated.Save(DataDir);
+        library = updated;
+        ShowActiveSource();
+    }
+
+    private void ShowActiveSource()
+    {
+        sourcePickerUpdating = true;
+        try
+        {
+            Sources.ItemsSource = library.Sources;
+            Sources.SelectedItem = ActiveSource;
+        }
+        finally { sourcePickerUpdating = false; }
+        ApplyPlaylist(ActiveSource?.Channels ?? []);
+    }
+
+    private void SourceChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (sourcePickerUpdating || Sources.SelectedItem is not PlaylistSource selected) return;
+        if (loading) { ShowActiveSource(); return; }
+        try
+        {
+            Search.Clear();
+            SaveLibrary(library with { ActiveId = selected.Id });
+            Save();
+            Status.Text = $"已切换到 {selected.Name} · {selected.Channels.Count} 个频道";
+        }
+        catch
+        {
+            ShowActiveSource();
+            Status.Text = "无法保存来源选择。";
+        }
+    }
+
     private void ApplyPlaylist(List<Channel> channels)
     {
         var newsSource = 0;
@@ -243,17 +290,85 @@ public partial class MainWindow : Window
     }
     private async void ImportUrl(object sender, RoutedEventArgs e)
     {
-        var dialog = new Window { Title = "添加订阅", Width = 560, Height = 200, ResizeMode = ResizeMode.NoResize, Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = Background, Foreground = Foreground };
+        var dialog = new Window { Title = "添加订阅", Width = 560, SizeToContent = SizeToContent.Height, ResizeMode = ResizeMode.NoResize, Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = Background, Foreground = Foreground };
         var panel = new StackPanel { Margin = new Thickness(20) };
-        panel.Children.Add(new TextBlock { Text = "输入 M3U / M3U8 订阅地址", Margin = new Thickness(0, 0, 0, 10) });
-        var input = new TextBox { Text = source?.StartsWith("http") == true ? source : "", Margin = new Thickness(0, 0, 0, 14) };
+        var name = new TextBox { Style = (Style)FindResource("DialogInput"), Margin = new Thickness(0, 0, 0, 12) };
+        panel.Children.Add(new Label { Content = "来源名称（可选）", Target = name, Padding = new Thickness(0, 0, 0, 5) });
+        panel.Children.Add(name);
+        var input = new TextBox { Style = (Style)FindResource("DialogInput"), Margin = new Thickness(0, 0, 0, 14) };
+        panel.Children.Add(new Label { Content = "M3U / M3U8 订阅地址", Target = input, Padding = new Thickness(0, 0, 0, 5) });
         panel.Children.Add(input);
         var ok = new Button { Content = "导入", IsDefault = true, HorizontalAlignment = HorizontalAlignment.Right };
         ok.Click += (_, _) => { if (Uri.TryCreate(input.Text.Trim(), UriKind.Absolute, out var u) && u.Scheme is "http" or "https") dialog.DialogResult = true; else MessageBox.Show(dialog, "请输入有效的 HTTP 或 HTTPS 地址。"); };
         panel.Children.Add(ok); dialog.Content = panel;
-        if (dialog.ShowDialog() == true) await LoadPlaylist(input.Text.Trim());
+        dialog.Loaded += (_, _) => input.Focus();
+        if (dialog.ShowDialog() == true) await LoadPlaylist(input.Text.Trim(), string.IsNullOrWhiteSpace(name.Text) ? null : name.Text.Trim());
     }
-    private async void RefreshPlaylist(object sender, RoutedEventArgs e) { if (source != null) await LoadPlaylist(source); else Status.Text = "请先导入文件或添加订阅。"; }
+    private async void RefreshPlaylist(object sender, RoutedEventArgs e) { if (ActiveSource?.Location is string location) await LoadPlaylist(location); else Status.Text = "请先导入文件或添加订阅。"; }
+    private void ManageSources(object sender, RoutedEventArgs e)
+    {
+        if (loading || !sourcesReady) return;
+        var dialog = new Window
+        {
+            Title = "管理播放来源", Owner = this, Width = 480, Height = 360,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Background = Background, Foreground = Foreground
+        };
+        var layout = new DockPanel { Margin = new Thickness(18) };
+        var controls = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
+        DockPanel.SetDock(controls, Dock.Bottom);
+        layout.Children.Add(controls);
+        var name = new TextBox { Style = (Style)FindResource("DialogInput") };
+        controls.Children.Add(name);
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+        controls.Children.Add(buttons);
+        var rename = new Button { Content = "保存名称", IsEnabled = false };
+        var remove = new Button { Content = "移除来源", IsEnabled = false };
+        var done = new Button { Content = "完成", IsCancel = true };
+        buttons.Children.Add(rename);
+        buttons.Children.Add(remove);
+        buttons.Children.Add(done);
+        var list = new ListBox { ItemsSource = library.Sources };
+        layout.Children.Add(list);
+        list.SelectionChanged += (_, _) =>
+        {
+            var selected = list.SelectedItem as PlaylistSource;
+            name.Text = selected?.Name ?? "";
+            rename.IsEnabled = remove.IsEnabled = selected != null;
+        };
+        bool Update(SourceLibrary updated, Guid? selectedId)
+        {
+            try { SaveLibrary(updated); Save(); }
+            catch
+            {
+                MessageBox.Show(dialog, "无法保存播放来源。", "轻播");
+                return false;
+            }
+            list.ItemsSource = library.Sources;
+            list.SelectedItem = library.Sources.FirstOrDefault(item => item.Id == selectedId);
+            return true;
+        }
+        rename.Click += (_, _) =>
+        {
+            if (list.SelectedItem is not PlaylistSource selected || string.IsNullOrWhiteSpace(name.Text)) return;
+            Update(library with
+            {
+                Sources = library.Sources.Select(item => item.Id == selected.Id ? item with { Name = name.Text.Trim() } : item).ToList()
+            }, selected.Id);
+        };
+        remove.Click += (_, _) =>
+        {
+            if (list.SelectedItem is not PlaylistSource selected ||
+                MessageBox.Show(dialog, $"从轻播移除「{selected.Name}」？", "移除来源",
+                    MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+            var remaining = library.Sources.Where(item => item.Id != selected.Id).ToList();
+            var activeId = library.ActiveId == selected.Id ? remaining.FirstOrDefault()?.Id : library.ActiveId;
+            Update(new(remaining, activeId), activeId);
+        };
+        list.SelectedItem = ActiveSource;
+        dialog.Content = layout;
+        dialog.ShowDialog();
+    }
     private async void OnDrop(object sender, DragEventArgs e) { if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0) await LoadPlaylist(files[0]); }
     private void TogglePause(object sender, RoutedEventArgs e) { if (!playbackBusy && !closing) engine?.TogglePause(); }
     private async void StopPlayback(object sender, RoutedEventArgs e)
@@ -321,10 +436,10 @@ public partial class MainWindow : Window
     }
     private void Save()
     {
-        try { Directory.CreateDirectory(DataDir); File.WriteAllText(Path.Combine(DataDir, "settings.json"), JsonSerializer.Serialize(new Preferences(source, current?.Url, Volume.Value))); }
+        try { Directory.CreateDirectory(DataDir); File.WriteAllText(Path.Combine(DataDir, "settings.json"), JsonSerializer.Serialize(new Preferences(ActiveSource?.Location, all.Any(c => c.Url == current?.Url) ? current?.Url : null, Volume.Value))); }
         catch { /* Playback should remain available when preferences cannot be saved. */ }
     }
-    private async void OnClosing(object? sender, CancelEventArgs e)
+    private void OnClosing(object? sender, CancelEventArgs e)
     {
         if (closeReady) return;
         e.Cancel = true;
@@ -332,8 +447,19 @@ public partial class MainWindow : Window
         closing = true;
         ++playbackRequest;
         videoDoubleClick?.Dispose();
+        // Let WPF finish the cancelled Closing event before hiding the HWND.
+        Dispatcher.BeginInvoke(new Action(async () =>
+        {
+            Hide();
+            await CloseInBackground();
+        }));
+    }
+
+    private async Task CloseInBackground()
+    {
+        // Yield so the hidden window disappears before writing settings.
+        await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
         Save();
-        Status.Text = "正在关闭播放器…";
         var shutdown = ShutdownPlayback();
         if (await Task.WhenAny(shutdown, Task.Delay(4000)) != shutdown)
         {

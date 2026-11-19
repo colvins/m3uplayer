@@ -29,5 +29,16 @@
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Foreground" Value="#202024"/>
     </Style>
+    <Style x:Key="DialogInput" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="#878793"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="MinHeight" Value="34"/>
+      <Style.Triggers>
+        <Trigger Property="IsKeyboardFocused" Value="True">
+          <Setter Property="BorderBrush" Value="#006EDC"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
   </Application.Resources>
 </Application>

@@ -18,3 +18,29 @@ Check(normalized.Contains("#EXT-X-MEDIA-SEQUENCE:9"), "HLS sequence preserved");
 targets.Clear();
 HlsRelay.Normalize("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=40000000\nvariant\n", new Uri("https://example.org/live/"), (u, ext) => { targets.Add((u, ext)); return u.ToString(); });
 Check(targets[0].Item2 == ".m3u8", "nested master playlist recognized");
+
+var libraryDir = Path.Combine(Path.GetTempPath(), "light-m3u-library-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(libraryDir);
+try
+{
+    const string oldAddress = "https://example.org/previous.m3u";
+    var legacy = Path.Combine(libraryDir, "playlist.m3u");
+    File.WriteAllText(legacy, "#EXTM3U\n#EXTINF:-1,旧频道\nhttps://example.org/previous.ts");
+    var migrated = SourceLibrary.Load(libraryDir, oldAddress);
+    var original = migrated.Sources.Single();
+    Check(original.Location == oldAddress && original.Channels.Single().Name == "旧频道", "legacy URL and cached channels migrated");
+    var added = new PlaylistSource(Guid.NewGuid(), "第二个来源", "https://example.net/next.m3u",
+        Playlist.Parse("#EXTM3U\n#EXTINF:-1,新频道\nhttps://example.net/next.ts"));
+    new SourceLibrary([original, added], added.Id).Save(libraryDir);
+    var restored = SourceLibrary.Load(libraryDir, oldAddress);
+    Check(restored.Sources.Count == 2 && restored.ActiveId == added.Id, "two sources and selected source survive restart");
+    Check(restored.Sources[0].Channels.Single().Name == "旧频道" && File.Exists(legacy), "new source leaves previous source and legacy cache intact");
+    File.Delete(legacy);
+    File.Delete(Path.Combine(libraryDir, "sources.json"));
+    Check(SourceLibrary.Load(libraryDir, oldAddress).Sources.Single().Location == oldAddress, "legacy address survives missing cache");
+}
+finally
+{
+    foreach (var file in Directory.EnumerateFiles(libraryDir)) File.Delete(file);
+    Directory.Delete(libraryDir);
+}
